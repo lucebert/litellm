@@ -7,7 +7,8 @@ from litellm.proxy._types import (
 )
 from litellm.proxy.utils import hash_token
 from litellm import get_secret
-from typing import Any, List, Literal, Optional, Union
+from typing import Any, List, Literal, Optional, Union, Dict
+from collections import defaultdict
 import json
 from datetime import datetime
 from litellm._logging import verbose_proxy_logger
@@ -35,6 +36,9 @@ class DynamoDBWrapper(CustomDB):
         from aiodynamo.http.aiohttp import AIOHTTP
         from aiohttp import ClientSession
 
+        self._connection_pool = None
+        self._client = None
+        self.session = None
         self.throughput_type = None
         if database_arguments.billing_mode == "PAY_PER_REQUEST":
             self.throughput_type = PayPerRequest()
@@ -110,14 +114,18 @@ class DynamoDBWrapper(CustomDB):
         import aiohttp
 
         verbose_proxy_logger.debug("DynamoDB Wrapper - Attempting to connect")
+        if self._client is not None:
+            return
+
         self.set_env_vars_based_on_arn()
-        # before making ClientSession check if ssl_verify=False
-        if self.database_arguments.ssl_verify == False:
-            client_session = ClientSession(connector=aiohttp.TCPConnector(ssl=False))
-        else:
-            client_session = ClientSession()
-        async with client_session as session:
-            client = Client(AIOHTTP(session), Credentials.auto(), self.region_name)
+        connector = aiohttp.TCPConnector(
+            ssl=False if not self.database_arguments.ssl_verify else None,
+            limit=50,  # Connection pool size
+            ttl_dns_cache=300,  # DNS cache TTL
+            keepalive_timeout=60  # Keep connections alive
+        )
+        self.session = ClientSession(connector=connector)
+        self._client = Client(AIOHTTP(self.session), Credentials.auto(), self.region_name)
             ## User
             try:
                 error_occurred = False
@@ -187,34 +195,56 @@ class DynamoDBWrapper(CustomDB):
                 )
             verbose_proxy_logger.debug("DynamoDB Wrapper - Done connecting()")
 
+    async def batch_write_items(
+        self,
+        items: List[Dict[str, Any]],
+        table_name: Literal["user", "key", "config", "spend"]
+    ) -> None:
+        """
+        Batch write items to a table using DynamoDB batch operations
+        """
+        if not items:
+            return
+
+        self.set_env_vars_based_on_arn()
+        if self._client is None:
+            await self.connect()
+
+        client = self._client
+        table = None
+        if table_name == "user":
+            table = client.table(self.database_arguments.user_table_name)
+        elif table_name == "key":
+            table = client.table(self.database_arguments.key_table_name)
+        elif table_name == "config":
+            table = client.table(self.database_arguments.config_table_name)
+        elif table_name == "spend":
+            table = client.table(self.database_arguments.spend_table_name)
+
+        # Process items in batches of 25 (DynamoDB limit)
+        batch_size = 25
+        for i in range(0, len(items), batch_size):
+            batch = items[i:i + batch_size]
+            batch_items = []
+            for item in batch:
+                item = item.copy()
+                for k, v in item.items():
+                    if k == "token" and item[k].startswith("sk-"):
+                        item[k] = hash_token(token=v)
+                    if isinstance(v, datetime):
+                        item[k] = v.isoformat()
+                batch_items.append(item)
+
+            # Write batch
+            await table.batch_write_items(items=batch_items)
+
     async def insert_data(
         self, value: Any, table_name: Literal["user", "key", "config", "spend"]
     ):
-        from aiodynamo.client import Client
-        from aiodynamo.credentials import Credentials, StaticCredentials
-        from aiodynamo.http.httpx import HTTPX
-        from aiodynamo.models import (
-            Throughput,
-            KeySchema,
-            KeySpec,
-            KeyType,
-            PayPerRequest,
-        )
-        from yarl import URL
-        from aiodynamo.expressions import UpdateExpression, F, Value
-        from aiodynamo.models import ReturnValues
-        from aiodynamo.http.aiohttp import AIOHTTP
-        from aiohttp import ClientSession
-        import aiohttp
-
         self.set_env_vars_based_on_arn()
-
-        if self.database_arguments.ssl_verify == False:
-            client_session = ClientSession(connector=aiohttp.TCPConnector(ssl=False))
-        else:
-            client_session = ClientSession()
-        async with client_session as session:
-            client = Client(AIOHTTP(session), Credentials.auto(), self.region_name)
+        if self._client is None:
+            await self.connect()
+        client = self._client
             table = None
             if table_name == "user":
                 table = client.table(self.database_arguments.user_table_name)
@@ -235,32 +265,10 @@ class DynamoDBWrapper(CustomDB):
             return await table.put_item(item=value, return_values=ReturnValues.all_old)
 
     async def get_data(self, key: str, table_name: Literal["user", "key", "config"]):
-        from aiodynamo.client import Client
-        from aiodynamo.credentials import Credentials, StaticCredentials
-        from aiodynamo.http.httpx import HTTPX
-        from aiodynamo.models import (
-            Throughput,
-            KeySchema,
-            KeySpec,
-            KeyType,
-            PayPerRequest,
-        )
-        from yarl import URL
-        from aiodynamo.expressions import UpdateExpression, F, Value
-        from aiodynamo.models import ReturnValues
-        from aiodynamo.http.aiohttp import AIOHTTP
-        from aiohttp import ClientSession
-        import aiohttp
-
         self.set_env_vars_based_on_arn()
-
-        if self.database_arguments.ssl_verify == False:
-            client_session = ClientSession(connector=aiohttp.TCPConnector(ssl=False))
-        else:
-            client_session = ClientSession()
-
-        async with client_session as session:
-            client = Client(AIOHTTP(session), Credentials.auto(), self.region_name)
+        if self._client is None:
+            await self.connect()
+        client = self._client
             table = None
             key_name = None
             if table_name == "user":
@@ -305,33 +313,70 @@ class DynamoDBWrapper(CustomDB):
                 new_response = LiteLLM_Config(**response)
             return new_response
 
+    async def batch_get_items(
+        self,
+        keys: List[str],
+        table_name: Literal["user", "key", "config"]
+    ) -> List[Any]:
+        """
+        Batch get items from a table using DynamoDB batch operations
+        """
+        if not keys:
+            return []
+
+        self.set_env_vars_based_on_arn()
+        if self._client is None:
+            await self.connect()
+
+        client = self._client
+        table = None
+        key_name = None
+        if table_name == "user":
+            table = client.table(self.database_arguments.user_table_name)
+            key_name = "user_id"
+        elif table_name == "key":
+            table = client.table(self.database_arguments.key_table_name)
+            key_name = "token"
+        elif table_name == "config":
+            table = client.table(self.database_arguments.config_table_name)
+            key_name = "param_name"
+
+        # Process keys in batches of 100 (DynamoDB limit)
+        batch_size = 100
+        results = []
+        for i in range(0, len(keys), batch_size):
+            batch = keys[i:i + batch_size]
+            key_items = [{key_name: key} for key in batch]
+            batch_results = await table.batch_get_items(keys=key_items)
+            
+            for response in batch_results:
+                if table_name == "user":
+                    results.append(LiteLLM_UserTable(**response))
+                elif table_name == "key":
+                    transformed = {}
+                    for k, v in response.items():
+                        if ((k == "aliases" or k == "config" or k == "metadata" 
+                             or k == "permissions" or k == "model_spend" 
+                             or k == "model_max_budget") 
+                            and v is not None and isinstance(v, str)):
+                            transformed[k] = json.loads(v)
+                        elif (k == "tpm_limit" or k == "rpm_limit") and isinstance(v, float):
+                            transformed[k] = int(v)
+                        else:
+                            transformed[k] = v
+                    results.append(LiteLLM_VerificationToken(**transformed))
+                elif table_name == "config":
+                    results.append(LiteLLM_Config(**response))
+
+        return results
+
     async def update_data(
         self, key: str, value: dict, table_name: Literal["user", "key", "config"]
     ):
         self.set_env_vars_based_on_arn()
-        from aiodynamo.client import Client
-        from aiodynamo.credentials import Credentials, StaticCredentials
-        from aiodynamo.http.httpx import HTTPX
-        from aiodynamo.models import (
-            Throughput,
-            KeySchema,
-            KeySpec,
-            KeyType,
-            PayPerRequest,
-        )
-        from yarl import URL
-        from aiodynamo.expressions import UpdateExpression, F, Value
-        from aiodynamo.models import ReturnValues
-        from aiodynamo.http.aiohttp import AIOHTTP
-        from aiohttp import ClientSession
-        import aiohttp
-
-        if self.database_arguments.ssl_verify == False:
-            client_session = ClientSession(connector=aiohttp.TCPConnector(ssl=False))
-        else:
-            client_session = ClientSession()
-        async with client_session as session:
-            client = Client(AIOHTTP(session), Credentials.auto(), self.region_name)
+        if self._client is None:
+            await self.connect()
+        client = self._client
             table = None
             key_name = None
             try:
