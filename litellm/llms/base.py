@@ -1,45 +1,81 @@
-## This is a template base class to be used for adding new LLM providers via API calls
-import litellm
+from abc import ABC, abstractmethod
+from typing import Optional, Dict, Any, Union, List
+from dataclasses import dataclass
 import httpx
-from typing import Optional
+from litellm.exceptions import LiteLLMException
 
+@dataclass
+class CompletionResult:
+    text: str
+    model: str
+    usage: Dict[str, int]
+    metadata: Dict[str, Any]
 
-class BaseLLM:
-    _client_session: Optional[httpx.Client] = None
+@dataclass
+class EmbeddingResult:
+    embeddings: List[List[float]]
+    model: str
+    usage: Dict[str, int]
 
-    def create_client_session(self):
-        if litellm.client_session:
-            _client_session = litellm.client_session
-        else:
-            _client_session = httpx.Client()
+class BaseLLM(ABC):
+    def __init__(self, model_name: str):
+        from ..utils.http_client import HTTPClientManager, ClientConfig
+        from ..config.settings import ConfigManager
 
-        return _client_session
+        self.model_name = model_name
+        self._config_manager = ConfigManager()
+        
+        config = self._config_manager.get_merged_config(model_name)
+        client_config = ClientConfig(
+            timeout=config['timeout'],
+            max_retries=config['max_retries']
+        )
+        self._http = HTTPClientManager(client_config)
 
-    def create_aclient_session(self):
-        if litellm.aclient_session:
-            _aclient_session = litellm.aclient_session
-        else:
-            _aclient_session = httpx.AsyncClient()
+    def __del__(self):
+        if hasattr(self, '_http'):
+            self._http.close()
 
-        return _aclient_session
+    async def __aclose__(self):
+        if hasattr(self, '_http'):
+            await self._http.aclose()
 
-    def __exit__(self):
-        if hasattr(self, "_client_session"):
-            self._client_session.close()
+    @property
+    def http(self):
+        return self._http
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if hasattr(self, "_aclient_session"):
-            await self._aclient_session.aclose()
+    @abstractmethod
+    def validate_environment(self) -> None:
+        """Validate and set up required environment for the model."""
+        raise NotImplementedError
 
-    def validate_environment(self):  # set up the environment required to run the model
-        pass
-
+    @abstractmethod
     def completion(
-        self, *args, **kwargs
-    ):  # logic for parsing in - calling - parsing out model completion calls
-        pass
+        self,
+        prompt: Union[str, List[str]],
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        **kwargs
+    ) -> CompletionResult:
+        """Generate completion for the given prompt."""
+        raise NotImplementedError
 
+    @abstractmethod
     def embedding(
-        self, *args, **kwargs
-    ):  # logic for parsing in - calling - parsing out model embedding calls
-        pass
+        self,
+        text: Union[str, List[str]],
+        model: str,
+        **kwargs
+    ) -> EmbeddingResult:
+        """Generate embeddings for the given text."""
+        raise NotImplementedError
+
+    def _handle_error(self, error: Exception) -> None:
+        """Centralized error handling for LLM operations."""
+        if isinstance(error, httpx.HTTPError):
+            raise LiteLLMException(f"HTTP Error: {str(error)}")
+        elif isinstance(error, TimeoutError):
+            raise LiteLLMException("Request timed out")
+        else:
+            raise LiteLLMException(f"Unexpected error: {str(error)}")
